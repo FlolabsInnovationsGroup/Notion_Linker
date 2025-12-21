@@ -22,29 +22,12 @@ PROJECT_VALUE = os.getenv("PROJECT_VALUE", "Program tasks")
 TASK_RELATION_PROPERTY_NAME = os.getenv("TASK_RELATION_PROPERTY_NAME", "Task")
 DESCRIPTION_PROPERTY_NAME = os.getenv("DESCRIPTION_PROPERTY_NAME", "Description")
 
-# LLM configuration
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
-HF_API_TOKEN = os.getenv("HF_API_TOKEN", "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").strip()
-HF_MODEL = os.getenv("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.2").strip()
-
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
     "Notion-Version": "2022-06-28",
     "Content-Type": "application/json",
 }
-OPENAI_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_HEADERS = {
-    "Authorization": f"Bearer {OPENAI_API_KEY}",
-    "Content-Type": "application/json",
-}
-HF_API_BASE = "https://router.huggingface.co/models"
-HF_HEADERS = (
-    {"Authorization": f"Bearer {HF_API_TOKEN}", "Content-Type": "application/json"}
-    if HF_API_TOKEN
-    else {}
-)
 
 
 def _normalize_notion_id(raw: str, hyphenated: bool = False) -> Optional[str]:
@@ -73,15 +56,11 @@ def _parse_markdown_link(text: str) -> Optional[Dict[str, str]]:
 
 def build_task_indexes(tasks: List[Dict]) -> Dict[str, Dict[str, str]]:
     by_id: Dict[str, str] = {}
-    by_title: Dict[str, str] = {}
     for task in tasks:
         nid = _normalize_notion_id(task["id"], hyphenated=False)
         if nid and nid not in by_id:
             by_id[nid] = task["id"]
-        title = task["name"].strip().lower()
-        if title and title not in by_title:
-            by_title[title] = task["id"]
-    return {"by_id": by_id, "by_title": by_title}
+    return {"by_id": by_id}
 
 
 def _safe_raise_for_status(response: requests.Response) -> None:
@@ -166,7 +145,7 @@ def choose_task_for_description(
         logging.warning("No tasks available for matching")
         return None
 
-    # First try deterministic matching using the markdown link contents
+    # Deterministic matching using the markdown link contents
     link = _parse_markdown_link(description)
     if link:
         # Match by Notion page ID in the URL
@@ -176,65 +155,6 @@ def choose_task_for_description(
             if candidate and candidate in task_index.get("by_id", {}):
                 logging.info("Matched by page ID from link")
                 return task_index["by_id"][candidate]
-        # Match by link label vs task title (case-insensitive)
-        label = link["label"].strip().lower()
-        if label and label in task_index.get("by_title", {}):
-            logging.info("Matched by link label to task title")
-            return task_index["by_title"][label]
-
-    task_lines = [f"- {task['name']} (id: {task['id']})" for task in tasks]
-    prompt = (
-        "You match a time entry to a task by name.\n"
-        "Return strictly JSON: {\"task_id\": \"<id>\"} when confident, or {\"task_id\": null} if none match.\n"
-        "Only choose from the provided tasks.\n\n"
-        f"Time Entry Description: {description}\n\n"
-        "Available tasks:\n" + "\n".join(task_lines)
-    )
-
-    body = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": "You return concise JSON only."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0,
-        "max_tokens": 20,
-    }
-    if OPENAI_API_KEY:
-        resp = requests.post(OPENAI_URL, headers=OPENAI_HEADERS, json=body, timeout=30)
-        _safe_raise_for_status(resp)
-        try:
-            content = resp.json()["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
-            return parsed.get("task_id")
-        except Exception as exc:  # pragma: no cover - runtime logging
-            logging.warning("OpenAI LLM parsing failed: %s", exc)
-            return None
-
-    if HF_API_TOKEN:
-        hf_body = {
-            "inputs": prompt,
-            "parameters": {"max_new_tokens": 64, "temperature": 0.0},
-        }
-        resp = requests.post(
-            f"{HF_API_BASE}/{HF_MODEL}", headers=HF_HEADERS, json=hf_body, timeout=60
-        )
-        _safe_raise_for_status(resp)
-        try:
-            data = resp.json()
-            # HF text-generation returns list of dicts with generated_text
-            generated = ""
-            if isinstance(data, list) and data and "generated_text" in data[0]:
-                generated = data[0]["generated_text"]
-            elif isinstance(data, dict) and "generated_text" in data:
-                generated = data["generated_text"]
-            parsed = json.loads(generated.strip().splitlines()[-1])
-            return parsed.get("task_id")
-        except Exception as exc:  # pragma: no cover - runtime logging
-            logging.warning("Hugging Face LLM parsing failed: %s", exc)
-            return None
-
-    logging.warning("No LLM credentials set; skipping matching")
     return None
 
 
@@ -262,11 +182,16 @@ def process_time_entries(limit: int = 100) -> Dict[str, int]:
                     "property": DESCRIPTION_PROPERTY_NAME,
                     "rich_text": {"does_not_contain": "No Description"},
                 },
+                {
+                    "property": DESCRIPTION_PROPERTY_NAME,
+                    "rich_text": {"contains": "https"},
+                },
             ]
         },
         limit=limit,
     )
-    task_options = collect_task_options(limit=limit)
+    # Grab a wider set of tasks to improve deterministic link-to-ID matching
+    task_options = collect_task_options(limit=max(limit, 1000))
     task_index = build_task_indexes(task_options)
     if not task_options:
         logging.warning("No tasks fetched from TASKS_DATABASE_ID=%s", TASKS_DATABASE_ID)
@@ -305,7 +230,7 @@ def process_time_entries(limit: int = 100) -> Dict[str, int]:
 
 
 def lambda_handler(event=None, context=None) -> Dict[str, object]:
-    result = process_time_entries(limit=100)
+    result = process_time_entries(limit=1000)
     logging.info("Processing complete: %s", result)
     return {"statusCode": 200, "body": json.dumps(result)}
 
