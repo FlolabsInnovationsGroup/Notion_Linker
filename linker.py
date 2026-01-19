@@ -2,8 +2,7 @@ import json
 import logging
 import os
 import re
-from typing import Dict, List, Optional
-
+from typing import Dict, List, Optional, Set
 
 import requests
 # Basic logging so Lambda output is easy to read
@@ -18,7 +17,6 @@ TASKS_DATABASE_ID = os.getenv(
     "TASKS_DATABASE_ID", "b5a15559fffc4a4f97161bf12e6fb400"
 ).strip()
 PROJECT_PROPERTY_NAME = os.getenv("PROJECT_PROPERTY_NAME", "Project")
-PROJECT_VALUE = os.getenv("PROJECT_VALUE", "Program tasks")
 TASK_RELATION_PROPERTY_NAME = os.getenv("TASK_RELATION_PROPERTY_NAME", "Task")
 DESCRIPTION_PROPERTY_NAME = os.getenv("DESCRIPTION_PROPERTY_NAME", "Description")
 
@@ -28,6 +26,21 @@ NOTION_HEADERS = {
     "Notion-Version": "2022-06-28",
     "Content-Type": "application/json",
 }
+
+PROJECT_EXCLUDE_KEYWORDS = (
+    "meeting",
+    "recording",
+    "recordings",
+    "call",
+    "calls",
+    "chat",
+    "email",
+    "emails",
+)
+NOTION_ID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}"
+)
+URL_PATTERN = re.compile(r"https?://\S+")
 
 
 def _normalize_notion_id(raw: str, hyphenated: bool = False) -> Optional[str]:
@@ -47,11 +60,35 @@ def _normalize_notion_id(raw: str, hyphenated: bool = False) -> Optional[str]:
     ).lower()
 
 
-def _parse_markdown_link(text: str) -> Optional[Dict[str, str]]:
-    match = re.search(r"\[([^\]]+)\]\(([^)]+)\)", text)
-    if not match:
-        return None
-    return {"label": match.group(1).strip(), "url": match.group(2).strip()}
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen: Set[str] = set()
+    deduped: List[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            deduped.append(value)
+    return deduped
+
+
+def _find_urls(text: str) -> List[str]:
+    if not text:
+        return []
+    urls: List[str] = []
+    for match in URL_PATTERN.findall(text):
+        url = match.rstrip(").,;]'\"")
+        if url:
+            urls.append(url)
+    return urls
+
+
+def _match_task_id_from_text(
+    text: str, task_index: Dict[str, Dict[str, str]]
+) -> Optional[str]:
+    for match in NOTION_ID_PATTERN.findall(text):
+        candidate = _normalize_notion_id(match, hyphenated=False)
+        if candidate and candidate in task_index.get("by_id", {}):
+            return task_index["by_id"][candidate]
+    return None
 
 
 def build_task_indexes(tasks: List[Dict]) -> Dict[str, Dict[str, str]]:
@@ -98,6 +135,14 @@ def fetch_pages_from_database(
     return pages[:limit]
 
 
+def fetch_page(page_id: str) -> Dict:
+    resp = requests.get(
+        f"{NOTION_API_BASE}/pages/{page_id}", headers=NOTION_HEADERS, timeout=30
+    )
+    _safe_raise_for_status(resp)
+    return resp.json()
+
+
 def extract_title(properties: Dict) -> str:
     for prop in properties.values():
         if prop.get("type") == "title":
@@ -114,6 +159,68 @@ def extract_rich_text_content(page: Dict, property_name: str) -> str:
     if prop.get("type") == "title":
         return "".join(item.get("plain_text", "") for item in prop.get("title", []))
     return ""
+
+
+def extract_rich_text_links(page: Dict, property_name: str) -> List[str]:
+    prop = page.get("properties", {}).get(property_name)
+    if not prop:
+        return []
+    links: List[str] = []
+    if prop.get("type") == "rich_text":
+        for item in prop.get("rich_text", []):
+            href = item.get("href")
+            if href:
+                links.append(href)
+            links.extend(_find_urls(item.get("plain_text", "")))
+        return _dedupe_preserve_order(links)
+    if prop.get("type") == "title":
+        text = "".join(item.get("plain_text", "") for item in prop.get("title", []))
+        return _dedupe_preserve_order(_find_urls(text))
+    return []
+
+
+def extract_project_names(
+    page: Dict, project_cache: Optional[Dict[str, str]] = None
+) -> List[str]:
+    prop = page.get("properties", {}).get(PROJECT_PROPERTY_NAME)
+    if not prop:
+        return []
+    prop_type = prop.get("type")
+    if prop_type == "select":
+        selection = prop.get("select")
+        if selection and selection.get("name"):
+            return [selection["name"]]
+        return []
+    if prop_type == "multi_select":
+        return [
+            item.get("name", "")
+            for item in prop.get("multi_select", [])
+            if item.get("name")
+        ]
+    if prop_type == "relation":
+        if project_cache is None:
+            return []
+        names: List[str] = []
+        for relation in prop.get("relation", []):
+            rel_id = relation.get("id")
+            if not rel_id:
+                continue
+            name = project_cache.get(rel_id)
+            if name is None:
+                page_data = fetch_page(rel_id)
+                name = extract_title(page_data.get("properties", {})).strip()
+                project_cache[rel_id] = name
+            if name:
+                names.append(name)
+        return _dedupe_preserve_order(names)
+    return []
+
+
+def is_task_project(project_name: str) -> bool:
+    if not project_name:
+        return False
+    lowered = project_name.lower()
+    return not any(keyword in lowered for keyword in PROJECT_EXCLUDE_KEYWORDS)
 
 
 def has_task_relation(page: Dict) -> bool:
@@ -139,23 +246,19 @@ def update_time_entry_task(page_id: str, task_id: str) -> None:
 
 
 def choose_task_for_description(
-    description: str, tasks: List[Dict], task_index: Dict[str, Dict[str, str]]
+    description_text: str,
+    description_links: List[str],
+    tasks: List[Dict],
+    task_index: Dict[str, Dict[str, str]],
 ) -> Optional[str]:
     if not tasks:
         logging.warning("No tasks available for matching")
         return None
-
-    # Deterministic matching using the markdown link contents
-    link = _parse_markdown_link(description)
-    if link:
-        # Match by Notion page ID in the URL
-        id_match = re.search(r"([0-9a-fA-F]{32})", link["url"])
-        if id_match:
-            candidate = _normalize_notion_id(id_match.group(1), hyphenated=False)
-            if candidate and candidate in task_index.get("by_id", {}):
-                logging.info("Matched by page ID from link")
-                return task_index["by_id"][candidate]
-    return None
+    search_text = " ".join(description_links + [description_text])
+    match = _match_task_id_from_text(search_text, task_index)
+    if match:
+        logging.info("Matched by page ID in description")
+    return match
 
 
 def collect_task_options(limit: int = 100) -> List[Dict]:
@@ -168,12 +271,11 @@ def collect_task_options(limit: int = 100) -> List[Dict]:
     return options
 
 
-def process_time_entries(limit: int = 100) -> Dict[str, int]:
+def process_time_entries(limit: int = 100) -> Dict[str, object]:
     time_entries = fetch_pages_from_database(
         TIME_ENTRIES_DATABASE_ID,
         filter_payload={
             "and": [
-                {"property": PROJECT_PROPERTY_NAME, "select": {"equals": PROJECT_VALUE}},
                 {
                     "property": DESCRIPTION_PROPERTY_NAME,
                     "rich_text": {"is_not_empty": True},
@@ -181,10 +283,6 @@ def process_time_entries(limit: int = 100) -> Dict[str, int]:
                 {
                     "property": DESCRIPTION_PROPERTY_NAME,
                     "rich_text": {"does_not_contain": "No Description"},
-                },
-                {
-                    "property": DESCRIPTION_PROPERTY_NAME,
-                    "rich_text": {"contains": "https"},
                 },
             ]
         },
@@ -197,21 +295,61 @@ def process_time_entries(limit: int = 100) -> Dict[str, int]:
         logging.warning("No tasks fetched from TASKS_DATABASE_ID=%s", TASKS_DATABASE_ID)
     updated = 0
     skipped = 0
-    reasons = {"no_description": 0, "already_linked": 0, "no_match": 0}
+    reasons = {
+        "no_description": 0,
+        "no_link": 0,
+        "already_linked": 0,
+        "no_project": 0,
+        "non_task_project": 0,
+        "no_match": 0,
+    }
     sample_no_match: List[str] = []
+    projects_seen: Set[str] = set()
+    task_projects_seen: Set[str] = set()
+    non_task_projects_seen: Set[str] = set()
+    project_cache: Dict[str, str] = {}
 
     for entry in time_entries:
+        project_names = extract_project_names(entry, project_cache)
+        if project_names:
+            projects_seen.update(project_names)
+            task_like_projects = [
+                name for name in project_names if is_task_project(name)
+            ]
+            non_task_projects = [
+                name for name in project_names if not is_task_project(name)
+            ]
+            task_projects_seen.update(task_like_projects)
+            non_task_projects_seen.update(non_task_projects)
+        else:
+            task_like_projects = []
+
         description = extract_rich_text_content(entry, DESCRIPTION_PROPERTY_NAME)
-        if not description:
+        description_links = extract_rich_text_links(entry, DESCRIPTION_PROPERTY_NAME)
+        if not description and not description_links:
             skipped += 1
             reasons["no_description"] += 1
+            continue
+        if not description_links:
+            skipped += 1
+            reasons["no_link"] += 1
             continue
         if has_task_relation(entry):
             skipped += 1
             reasons["already_linked"] += 1
             continue
+        if not project_names:
+            skipped += 1
+            reasons["no_project"] += 1
+            continue
+        if not task_like_projects:
+            skipped += 1
+            reasons["non_task_project"] += 1
+            continue
 
-        task_id = choose_task_for_description(description, task_options, task_index)
+        task_id = choose_task_for_description(
+            description, description_links, task_options, task_index
+        )
         if task_id:
             update_time_entry_task(entry["id"], task_id)
             updated += 1
@@ -219,14 +357,25 @@ def process_time_entries(limit: int = 100) -> Dict[str, int]:
             skipped += 1
             reasons["no_match"] += 1
             if len(sample_no_match) < 5:
-                sample_no_match.append(description[:200])
+                sample_no_match.append(description[:200] or description_links[0][:200])
 
     logging.info(
         "Skip reasons: %s; sample no-match descriptions: %s",
         reasons,
         sample_no_match,
     )
-    return {"processed": len(time_entries), "updated": updated, "skipped": skipped}
+    logging.info(
+        "Projects seen: %s; task-like projects: %s; non-task projects: %s",
+        sorted(projects_seen),
+        sorted(task_projects_seen),
+        sorted(non_task_projects_seen),
+    )
+    return {
+        "processed": len(time_entries),
+        "updated": updated,
+        "skipped": skipped,
+        "projects_seen": sorted(projects_seen),
+    }
 
 
 def lambda_handler(event=None, context=None) -> Dict[str, object]:
