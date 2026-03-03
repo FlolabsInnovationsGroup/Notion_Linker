@@ -16,7 +16,6 @@ TIME_ENTRIES_DATABASE_ID = os.getenv(
 TASKS_DATABASE_ID = os.getenv(
     "TASKS_DATABASE_ID", "b5a15559fffc4a4f97161bf12e6fb400"
 ).strip()
-PROJECT_PROPERTY_NAME = os.getenv("PROJECT_PROPERTY_NAME", "Project")
 TASK_RELATION_PROPERTY_NAME = os.getenv("TASK_RELATION_PROPERTY_NAME", "Task")
 DESCRIPTION_PROPERTY_NAME = os.getenv("DESCRIPTION_PROPERTY_NAME", "Description")
 
@@ -27,16 +26,6 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
 }
 
-PROJECT_EXCLUDE_KEYWORDS = (
-    "meeting",
-    "recording",
-    "recordings",
-    "call",
-    "calls",
-    "chat",
-    "email",
-    "emails",
-)
 NOTION_ID_PATTERN = re.compile(
     r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}"
 )
@@ -135,14 +124,6 @@ def fetch_pages_from_database(
     return pages[:limit]
 
 
-def fetch_page(page_id: str) -> Dict:
-    resp = requests.get(
-        f"{NOTION_API_BASE}/pages/{page_id}", headers=NOTION_HEADERS, timeout=30
-    )
-    _safe_raise_for_status(resp)
-    return resp.json()
-
-
 def extract_title(properties: Dict) -> str:
     for prop in properties.values():
         if prop.get("type") == "title":
@@ -179,50 +160,6 @@ def extract_rich_text_links(page: Dict, property_name: str) -> List[str]:
     return []
 
 
-def extract_project_names(
-    page: Dict, project_cache: Optional[Dict[str, str]] = None
-) -> List[str]:
-    prop = page.get("properties", {}).get(PROJECT_PROPERTY_NAME)
-    if not prop:
-        return []
-    prop_type = prop.get("type")
-    if prop_type == "select":
-        selection = prop.get("select")
-        if selection and selection.get("name"):
-            return [selection["name"]]
-        return []
-    if prop_type == "multi_select":
-        return [
-            item.get("name", "")
-            for item in prop.get("multi_select", [])
-            if item.get("name")
-        ]
-    if prop_type == "relation":
-        if project_cache is None:
-            return []
-        names: List[str] = []
-        for relation in prop.get("relation", []):
-            rel_id = relation.get("id")
-            if not rel_id:
-                continue
-            name = project_cache.get(rel_id)
-            if name is None:
-                page_data = fetch_page(rel_id)
-                name = extract_title(page_data.get("properties", {})).strip()
-                project_cache[rel_id] = name
-            if name:
-                names.append(name)
-        return _dedupe_preserve_order(names)
-    return []
-
-
-def is_task_project(project_name: str) -> bool:
-    if not project_name:
-        return False
-    lowered = project_name.lower()
-    return not any(keyword in lowered for keyword in PROJECT_EXCLUDE_KEYWORDS)
-
-
 def has_task_relation(page: Dict) -> bool:
     prop = page.get("properties", {}).get(TASK_RELATION_PROPERTY_NAME)
     if not prop or prop.get("type") != "relation":
@@ -246,7 +183,6 @@ def update_time_entry_task(page_id: str, task_id: str) -> None:
 
 
 def choose_task_for_description(
-    description_text: str,
     description_links: List[str],
     tasks: List[Dict],
     task_index: Dict[str, Dict[str, str]],
@@ -254,10 +190,10 @@ def choose_task_for_description(
     if not tasks:
         logging.warning("No tasks available for matching")
         return None
-    search_text = " ".join(description_links + [description_text])
+    search_text = " ".join(description_links)
     match = _match_task_id_from_text(search_text, task_index)
     if match:
-        logging.info("Matched by page ID in description")
+        logging.info("Matched by page ID in description link")
     return match
 
 
@@ -299,31 +235,11 @@ def process_time_entries(limit: int = 100) -> Dict[str, object]:
         "no_description": 0,
         "no_link": 0,
         "already_linked": 0,
-        "no_project": 0,
-        "non_task_project": 0,
         "no_match": 0,
     }
     sample_no_match: List[str] = []
-    projects_seen: Set[str] = set()
-    task_projects_seen: Set[str] = set()
-    non_task_projects_seen: Set[str] = set()
-    project_cache: Dict[str, str] = {}
 
     for entry in time_entries:
-        project_names = extract_project_names(entry, project_cache)
-        if project_names:
-            projects_seen.update(project_names)
-            task_like_projects = [
-                name for name in project_names if is_task_project(name)
-            ]
-            non_task_projects = [
-                name for name in project_names if not is_task_project(name)
-            ]
-            task_projects_seen.update(task_like_projects)
-            non_task_projects_seen.update(non_task_projects)
-        else:
-            task_like_projects = []
-
         description = extract_rich_text_content(entry, DESCRIPTION_PROPERTY_NAME)
         description_links = extract_rich_text_links(entry, DESCRIPTION_PROPERTY_NAME)
         if not description and not description_links:
@@ -338,18 +254,8 @@ def process_time_entries(limit: int = 100) -> Dict[str, object]:
             skipped += 1
             reasons["already_linked"] += 1
             continue
-        if not project_names:
-            skipped += 1
-            reasons["no_project"] += 1
-            continue
-        if not task_like_projects:
-            skipped += 1
-            reasons["non_task_project"] += 1
-            continue
 
-        task_id = choose_task_for_description(
-            description, description_links, task_options, task_index
-        )
+        task_id = choose_task_for_description(description_links, task_options, task_index)
         if task_id:
             update_time_entry_task(entry["id"], task_id)
             updated += 1
@@ -364,17 +270,10 @@ def process_time_entries(limit: int = 100) -> Dict[str, object]:
         reasons,
         sample_no_match,
     )
-    logging.info(
-        "Projects seen: %s; task-like projects: %s; non-task projects: %s",
-        sorted(projects_seen),
-        sorted(task_projects_seen),
-        sorted(non_task_projects_seen),
-    )
     return {
         "processed": len(time_entries),
         "updated": updated,
         "skipped": skipped,
-        "projects_seen": sorted(projects_seen),
     }
 
 
