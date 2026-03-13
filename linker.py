@@ -16,6 +16,7 @@ TIME_ENTRIES_DATABASE_ID = os.getenv(
 TASKS_DATABASE_ID = os.getenv(
     "TASKS_DATABASE_ID", "b5a15559fffc4a4f97161bf12e6fb400"
 ).strip()
+PROJECT_PROPERTY_NAME = os.getenv("PROJECT_PROPERTY_NAME", "Project")
 TASK_RELATION_PROPERTY_NAME = os.getenv("TASK_RELATION_PROPERTY_NAME", "Task")
 DESCRIPTION_PROPERTY_NAME = os.getenv("DESCRIPTION_PROPERTY_NAME", "Description")
 
@@ -30,6 +31,21 @@ NOTION_ID_PATTERN = re.compile(
     r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}"
 )
 URL_PATTERN = re.compile(r"https?://\S+")
+EXCLUDED_PROJECT_NAMES = (
+    "Team meetings",
+    "Team calls",
+    "Team chat",
+    "Brainwriting",
+    "Checking Emails",
+    "Watching meeting recordings",
+    "Masterclass",
+    "Onboarding",
+    "Recordings",
+    "No project",
+)
+EXCLUDED_PROJECT_NAMES_CASEFOLD = {
+    project_name.casefold() for project_name in EXCLUDED_PROJECT_NAMES
+}
 
 
 def _normalize_notion_id(raw: str, hyphenated: bool = False) -> Optional[str]:
@@ -124,6 +140,16 @@ def fetch_pages_from_database(
     return pages[:limit]
 
 
+def fetch_database(database_id: str) -> Dict:
+    resp = requests.get(
+        f"{NOTION_API_BASE}/databases/{database_id}",
+        headers=NOTION_HEADERS,
+        timeout=30,
+    )
+    _safe_raise_for_status(resp)
+    return resp.json()
+
+
 def extract_title(properties: Dict) -> str:
     for prop in properties.values():
         if prop.get("type") == "title":
@@ -142,6 +168,86 @@ def extract_rich_text_content(page: Dict, property_name: str) -> str:
     return ""
 
 
+def build_project_exclusion_filters() -> List[Dict[str, object]]:
+    database = fetch_database(TIME_ENTRIES_DATABASE_ID)
+    prop = database.get("properties", {}).get(PROJECT_PROPERTY_NAME)
+    if not prop:
+        logging.warning(
+            "Project property %s was not found in Time Entries database schema",
+            PROJECT_PROPERTY_NAME,
+        )
+        return []
+
+    prop_type = prop.get("type")
+    if prop_type == "select":
+        option_names = [
+            option.get("name", "")
+            for option in prop.get("select", {}).get("options", [])
+            if option.get("name")
+        ]
+        matched_names = [
+            option_name
+            for option_name in option_names
+            if option_name.casefold() in EXCLUDED_PROJECT_NAMES_CASEFOLD
+        ]
+        if not matched_names:
+            matched_names = list(EXCLUDED_PROJECT_NAMES)
+        return [
+            {
+                "property": PROJECT_PROPERTY_NAME,
+                "select": {"does_not_equal": project_name},
+            }
+            for project_name in _dedupe_preserve_order(matched_names)
+        ]
+
+    if prop_type == "multi_select":
+        option_names = [
+            option.get("name", "")
+            for option in prop.get("multi_select", {}).get("options", [])
+            if option.get("name")
+        ]
+        matched_names = [
+            option_name
+            for option_name in option_names
+            if option_name.casefold() in EXCLUDED_PROJECT_NAMES_CASEFOLD
+        ]
+        if not matched_names:
+            matched_names = list(EXCLUDED_PROJECT_NAMES)
+        return [
+            {
+                "property": PROJECT_PROPERTY_NAME,
+                "multi_select": {"does_not_contain": project_name},
+            }
+            for project_name in _dedupe_preserve_order(matched_names)
+        ]
+
+    logging.warning(
+        "Project property %s has unsupported type %s for server-side exclusion",
+        PROJECT_PROPERTY_NAME,
+        prop_type,
+    )
+    return []
+
+
+def build_time_entries_filter() -> Dict[str, object]:
+    and_filters: List[Dict[str, object]] = [
+        {
+            "property": TASK_RELATION_PROPERTY_NAME,
+            "relation": {"is_empty": True},
+        },
+        {
+            "property": DESCRIPTION_PROPERTY_NAME,
+            "rich_text": {"is_not_empty": True},
+        },
+        {
+            "property": DESCRIPTION_PROPERTY_NAME,
+            "rich_text": {"does_not_contain": "No Description"},
+        },
+    ]
+    and_filters.extend(build_project_exclusion_filters())
+    return {"and": and_filters}
+
+
 def extract_rich_text_links(page: Dict, property_name: str) -> List[str]:
     prop = page.get("properties", {}).get(property_name)
     if not prop:
@@ -153,6 +259,12 @@ def extract_rich_text_links(page: Dict, property_name: str) -> List[str]:
             if href:
                 links.append(href)
             links.extend(_find_urls(item.get("plain_text", "")))
+            if item.get("type") == "mention":
+                mention = item.get("mention", {})
+                if mention.get("type") == "page":
+                    page_id = mention.get("page", {}).get("id")
+                    if page_id:
+                        links.append(page_id)
         return _dedupe_preserve_order(links)
     if prop.get("type") == "title":
         text = "".join(item.get("plain_text", "") for item in prop.get("title", []))
@@ -183,6 +295,7 @@ def update_time_entry_task(page_id: str, task_id: str) -> None:
 
 
 def choose_task_for_description(
+    description_text: str,
     description_links: List[str],
     tasks: List[Dict],
     task_index: Dict[str, Dict[str, str]],
@@ -190,10 +303,10 @@ def choose_task_for_description(
     if not tasks:
         logging.warning("No tasks available for matching")
         return None
-    search_text = " ".join(description_links)
+    search_text = " ".join(description_links + [description_text])
     match = _match_task_id_from_text(search_text, task_index)
     if match:
-        logging.info("Matched by page ID in description link")
+        logging.info("Matched by page ID in description content")
     return match
 
 
@@ -210,18 +323,7 @@ def collect_task_options(limit: int = 100) -> List[Dict]:
 def process_time_entries(limit: int = 100) -> Dict[str, object]:
     time_entries = fetch_pages_from_database(
         TIME_ENTRIES_DATABASE_ID,
-        filter_payload={
-            "and": [
-                {
-                    "property": DESCRIPTION_PROPERTY_NAME,
-                    "rich_text": {"is_not_empty": True},
-                },
-                {
-                    "property": DESCRIPTION_PROPERTY_NAME,
-                    "rich_text": {"does_not_contain": "No Description"},
-                },
-            ]
-        },
+        filter_payload=build_time_entries_filter(),
         limit=limit,
     )
     # Grab a wider set of tasks to improve deterministic link-to-ID matching
@@ -233,7 +335,6 @@ def process_time_entries(limit: int = 100) -> Dict[str, object]:
     skipped = 0
     reasons = {
         "no_description": 0,
-        "no_link": 0,
         "already_linked": 0,
         "no_match": 0,
     }
@@ -246,16 +347,17 @@ def process_time_entries(limit: int = 100) -> Dict[str, object]:
             skipped += 1
             reasons["no_description"] += 1
             continue
-        if not description_links:
-            skipped += 1
-            reasons["no_link"] += 1
-            continue
         if has_task_relation(entry):
             skipped += 1
             reasons["already_linked"] += 1
             continue
 
-        task_id = choose_task_for_description(description_links, task_options, task_index)
+        task_id = choose_task_for_description(
+            description,
+            description_links,
+            task_options,
+            task_index,
+        )
         if task_id:
             update_time_entry_task(entry["id"], task_id)
             updated += 1
@@ -278,7 +380,7 @@ def process_time_entries(limit: int = 100) -> Dict[str, object]:
 
 
 def lambda_handler(event=None, context=None) -> Dict[str, object]:
-    result = process_time_entries(limit=3000)
+    result = process_time_entries(limit=2000)
     logging.info("Processing complete: %s", result)
     return {"statusCode": 200, "body": json.dumps(result)}
 
