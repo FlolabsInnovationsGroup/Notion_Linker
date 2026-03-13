@@ -380,7 +380,7 @@ def process_time_entries(limit: int = 100) -> Dict[str, object]:
 
 
 def lambda_handler(event=None, context=None) -> Dict[str, object]:
-    result = process_time_entries(limit=2000)
+    result = process_time_entries(limit=3000)
     logging.info("Processing complete: %s", result)
     return {"statusCode": 200, "body": json.dumps(result)}
 
