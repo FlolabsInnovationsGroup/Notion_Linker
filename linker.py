@@ -114,14 +114,22 @@ def _safe_raise_for_status(response: requests.Response) -> None:
 
 
 def fetch_pages_from_database(
-    database_id: str, filter_payload: Optional[Dict] = None, limit: int = 100
+    database_id: str,
+    filter_payload: Optional[Dict] = None,
+    limit: Optional[int] = 100,
+    sorts: Optional[List[Dict[str, str]]] = None,
 ) -> List[Dict]:
     pages: List[Dict] = []
     cursor: Optional[str] = None
-    while len(pages) < limit:
-        payload: Dict[str, object] = {"page_size": min(100, limit - len(pages))}
+    while limit is None or len(pages) < limit:
+        page_size = 100 if limit is None else min(100, limit - len(pages))
+        if page_size <= 0:
+            break
+        payload: Dict[str, object] = {"page_size": page_size}
         if filter_payload:
             payload["filter"] = filter_payload
+        if sorts:
+            payload["sorts"] = sorts
         if cursor:
             payload["start_cursor"] = cursor
 
@@ -137,7 +145,7 @@ def fetch_pages_from_database(
         if not data.get("has_more") or not data.get("next_cursor"):
             break
         cursor = data["next_cursor"]
-    return pages[:limit]
+    return pages if limit is None else pages[:limit]
 
 
 def fetch_database(database_id: str) -> Dict:
@@ -310,8 +318,12 @@ def choose_task_for_description(
     return match
 
 
-def collect_task_options(limit: int = 100) -> List[Dict]:
-    pages = fetch_pages_from_database(TASKS_DATABASE_ID, limit=limit)
+def collect_task_options(limit: Optional[int] = None) -> List[Dict]:
+    pages = fetch_pages_from_database(
+        TASKS_DATABASE_ID,
+        limit=limit,
+        sorts=[{"timestamp": "last_edited_time", "direction": "descending"}],
+    )
     options: List[Dict] = []
     for page in pages:
         title = extract_title(page.get("properties", {}))
@@ -327,7 +339,7 @@ def process_time_entries(limit: int = 100) -> Dict[str, object]:
         limit=limit,
     )
     # Grab a wider set of tasks to improve deterministic link-to-ID matching
-    task_options = collect_task_options(limit=max(limit, 1000))
+    task_options = collect_task_options(limit=None)
     task_index = build_task_indexes(task_options)
     if not task_options:
         logging.warning("No tasks fetched from TASKS_DATABASE_ID=%s", TASKS_DATABASE_ID)
